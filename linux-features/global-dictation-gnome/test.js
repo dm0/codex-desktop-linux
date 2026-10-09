@@ -368,12 +368,25 @@ function installerFixture(t) {
     const app = path.join(root, 'app'), home = path.join(root, 'home');
     const featuresDir = path.join(root, 'features');
     fs.cpSync(path.join(feature, 'extension'), path.join(featuresDir, 'global-dictation-gnome/extension'), {recursive: true});
-    write(path.join(bin, 'id'), '#!/bin/sh\nprintf "1000\\n"\n', 0o755);
+    const uid = process.getuid() || 1000;
+    write(path.join(bin, 'id'), `#!/bin/sh\nprintf "${uid}\\n"\n`, 0o755);
+    // Model trusted sandbox ancestors independently of the host cache's umask.
+    // Inside the fixture use real modes and ownership, with a root-run UID shim.
+    write(path.join(bin, 'stat'), [
+        '#!/bin/bash', 'target="$4"',
+        'read -r owner mode < <(/usr/bin/stat -c "%u %a" -- "$target")',
+        `[[ "$owner" != ${process.getuid()} ]] || owner=${uid}`,
+        'if [[ "$target" == / || "$TEST_GNOME_FIXTURE_ROOT" == "$target/"* ]]; then',
+        '    owner=0; mode=755', 'fi',
+        `[[ "$target" != "\${TEST_GNOME_FOREIGN_PATH:-}" ]] || owner=${uid + 1}`,
+        '[[ "$target" != "${TEST_GNOME_ROOT_OWNER_PATH:-}" ]] || owner=0',
+        'printf "%s %s\\n" "$owner" "$mode"', '',
+    ].join('\n'), 0o755);
     write(path.join(bin, 'gnome-shell'), '#!/bin/sh\nprintf "GNOME Shell 48.2\\n"\n', 0o755);
     write(path.join(app, 'resources/native/codex-global-dictation-linux'), '#!/bin/sh\nexit 0\n', 0o755);
-    fs.mkdirSync(home);
+    fs.mkdirSync(home, {mode: 0o700});
     const env = {...process.env, PATH: `${bin}:${process.env.PATH}`, HOME: home,
-        XDG_CURRENT_DESKTOP: 'GNOME', XDG_SESSION_CLASS: 'user',
+        XDG_CURRENT_DESKTOP: 'GNOME', XDG_SESSION_CLASS: 'user', TEST_GNOME_FIXTURE_ROOT: root,
         XDG_DATA_HOME: '', CODEX_LINUX_APP_DIR: app, CODEX_LINUX_FEATURES_DIR: featuresDir};
     const parent = path.join(home, '.local/share/gnome-shell/extensions');
     const destination = path.join(parent, uuid);
@@ -385,7 +398,7 @@ function installerFixture(t) {
     function clean() {
         assert.deepEqual(fs.readdirSync(parent), [uuid]);
     }
-    return {root, bin, app, home, featuresDir, env, parent, destination, run, clean};
+    return {root, bin, app, home, featuresDir, env, parent, destination, run, clean, uid};
 }
 
 test('installer sync is explicit, idempotent and updates transactionally with a canonical helper config', t => {
@@ -441,7 +454,7 @@ test('installer refuses root, unsupported or hanging GNOME, missing helper and u
     const f = installerFixture(t);
     write(path.join(f.bin, 'id'), '#!/bin/sh\necho 0\n', 0o755);
     assert.match(f.run().stderr, /root/);
-    write(path.join(f.bin, 'id'), '#!/bin/sh\necho 1000\n', 0o755);
+    write(path.join(f.bin, 'id'), `#!/bin/sh\necho ${f.uid}\n`, 0o755);
     for (const version of ['44.9', '51.0', '145.0']) {
         write(path.join(f.bin, 'gnome-shell'), `#!/bin/sh\necho 'GNOME Shell ${version}'\n`, 0o755);
         assert.match(f.run().stderr, /Unsupported/);
@@ -459,9 +472,62 @@ test('installer refuses root, unsupported or hanging GNOME, missing helper and u
     assert.equal(fs.existsSync(f.parent), false);
 });
 
+test('installer rejects writable or foreign-owned ancestors before installing', t => {
+    const f = installerFixture(t);
+    for (const mode of [0o775, 0o777]) {
+        fs.chmodSync(f.home, mode);
+        assert.match(f.run().stderr, /Unsafe data directory/);
+        assert.equal(fs.existsSync(f.parent), false);
+        assert.equal(fs.statSync(f.home).mode & 0o777, mode);
+    }
+    fs.chmodSync(f.home, 0o755);
+    assert.match(f.run({TEST_GNOME_FOREIGN_PATH: f.home}).stderr, /Unsafe data directory/);
+    assert.equal(fs.existsSync(f.parent), false);
+    fs.mkdirSync(f.parent, {recursive: true, mode: 0o700});
+    fs.chmodSync(f.parent, 0o777);
+    assert.match(f.run().stderr, /Unsafe extension parent/);
+    assert.deepEqual(fs.readdirSync(f.parent), []);
+    assert.equal(fs.statSync(f.parent).mode & 0o777, 0o777);
+    fs.chmodSync(f.parent, 0o755);
+    assert.match(f.run({TEST_GNOME_FOREIGN_PATH: f.parent}).stderr, /Unsafe extension parent/);
+    assert.deepEqual(fs.readdirSync(f.parent), []);
+});
+
+test('installer preserves writable or foreign-owned managed state without repairing it', t => {
+    const f = installerFixture(t); f.run();
+    const paths = [f.destination, ...['extension.js', 'metadata.json', 'config.json',
+        '.chatgpt-community-owned.sha256'].map(file => path.join(f.destination, file))];
+    for (const target of paths) {
+        const original = fs.statSync(target).mode & 0o777;
+        for (const writable of [0o020, 0o002]) {
+            fs.chmodSync(target, original | writable);
+            assert.match(f.run().stderr, /Unmanaged or modified/);
+            assert.equal(fs.statSync(target).mode & 0o777, original | writable);
+            f.clean();
+        }
+        fs.chmodSync(target, original);
+        for (const ownerOverride of ['TEST_GNOME_FOREIGN_PATH', 'TEST_GNOME_ROOT_OWNER_PATH']) {
+            assert.match(f.run({[ownerOverride]: target}).stderr, /Unmanaged or modified/);
+            f.clean();
+        }
+    }
+    assert.equal(f.run().stderr, '');
+});
+
+test('backup permissions changed during rename are rejected and preserved', t => {
+    const f = installerFixture(t); f.run();
+    const before = fs.readFileSync(path.join(f.destination, 'extension.js'), 'utf8');
+    fs.appendFileSync(path.join(f.featuresDir, 'global-dictation-gnome/extension/extension.js'), '//new\n');
+    write(path.join(f.bin, 'mv'), '#!/bin/sh\n/usr/bin/mv "$@" || exit 1\ncase "$3" in *.previous.*) chmod 0666 "$3/extension.js";; esac\n', 0o755);
+    assert.match(f.run().stderr, /Backup changed during rename; restoring user changes/);
+    assert.equal(fs.readFileSync(path.join(f.destination, 'extension.js'), 'utf8'), before);
+    assert.equal(fs.statSync(path.join(f.destination, 'extension.js')).mode & 0o777, 0o666);
+    f.clean();
+});
+
 test('installer preserves unmanaged, modified, extra-entry and symlinked destinations', t => {
     const f = installerFixture(t);
-    fs.mkdirSync(f.destination, {recursive: true}); write(path.join(f.destination, 'mine'), 'keep');
+    fs.mkdirSync(f.destination, {recursive: true, mode: 0o700}); write(path.join(f.destination, 'mine'), 'keep');
     assert.match(f.run().stderr, /Unmanaged or modified/);
     assert.equal(fs.readFileSync(path.join(f.destination, 'mine'), 'utf8'), 'keep');
     fs.rmSync(f.destination, {recursive: true}); f.run();

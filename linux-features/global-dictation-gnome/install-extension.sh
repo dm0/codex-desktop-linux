@@ -34,10 +34,25 @@ uid="$(id -u)" || skip 'Cannot determine user identity'
 version="$(timeout --kill-after=1s 2s gnome-shell --version)" || skip 'Cannot determine GNOME Shell version within timeout'
 [[ "$version" =~ ^GNOME\ Shell\ (45|46|47|48|49|50)(\.|$) ]] || skip "Unsupported GNOME Shell version: $version"
 
-# Reject ambiguous/control-bearing paths and symlinked ancestors before any writes.
+# Root may own shared ancestors; installed extension state must belong to this UID.
+trusted_permissions() {
+    local path="$1" ownership="${2:-ancestor}" metadata owner mode
+    metadata="$(stat -c '%u %a' -- "$path")" || return 1
+    read -r owner mode <<< "$metadata"
+    [[ "$owner" =~ ^[0-9]+$ && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    if [[ "$ownership" == user ]]; then
+        [[ "$owner" == "$uid" ]] || return 1
+    else
+        [[ "$owner" == 0 || "$owner" == "$uid" ]] || return 1
+    fi
+    (( (8#$mode & 0022) == 0 ))
+}
+
+# Reject ambiguous paths, symlinks and externally writable ancestors before writes.
 safe_path() {
     local path="$1" part current=''
     [[ "$path" == /* && "$path" != / && ! "$path" =~ [[:cntrl:]] ]] || return 1
+    trusted_permissions / || return 1
     local -a parts
     IFS=/ read -r -a parts <<< "$path"
     for part in "${parts[@]}"; do
@@ -45,7 +60,9 @@ safe_path() {
         [[ "$part" != . && "$part" != .. ]] || return 1
         current="$current/$part"
         [[ ! -L "$current" ]] || return 1
-        [[ ! -e "$current" || -d "$current" ]] || return 1
+        if [[ -e "$current" ]]; then
+            [[ -d "$current" ]] && trusted_permissions "$current" || return 1
+        fi
     done
 }
 if [[ -n "${XDG_DATA_HOME:-}" ]]; then
@@ -54,7 +71,7 @@ else
     [[ -n "${HOME:-}" ]] || skip 'HOME and XDG_DATA_HOME are unavailable'
     data="$HOME/.local/share"
 fi
-safe_path "$data" || skip 'Unsafe data directory (absolute non-symlink path required)'
+safe_path "$data" || skip 'Unsafe data directory (trusted owner, no group/other write, absolute non-symlink path required)'
 parent="$data/gnome-shell/extensions"
 safe_path "$parent" || skip 'Unsafe extension parent directory'
 [[ -n "${CODEX_LINUX_APP_DIR:-}" && -n "${CODEX_LINUX_FEATURES_DIR:-}" ]] || skip 'Missing launcher paths'
@@ -81,11 +98,13 @@ manifest() {
 managed() {
     local dir="$1" count
     [[ -d "$dir" && ! -L "$dir" && -f "$dir/$marker" && ! -L "$dir/$marker" ]] || return 1
+    trusted_permissions "$dir" user || return 1
     # Fixed flat inventory excludes extra files, subdirectories, and every symlink.
     count="$(find "$dir" -mindepth 1 -maxdepth 1 -printf '. ' | wc -w)"
     [[ "$count" == 4 ]] || return 1
     for file in config.json extension.js metadata.json "$marker"; do
         [[ -f "$dir/$file" && ! -L "$dir/$file" ]] || return 1
+        trusted_permissions "$dir/$file" user || return 1
     done
     cmp -s -- "$dir/$marker" <(manifest "$dir")
 }

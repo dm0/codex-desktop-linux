@@ -124,7 +124,12 @@ The installer uses a fixed-inventory SHA-256 ownership manifest
 `metadata.json`. It refuses unmanaged directories, edited files/marker,
 additional entries, and symlinks in the destination or its ancestors. Absolute,
 non-control-bearing data paths are required; unsafe HOME/XDG paths are rejected.
-An unchanged manifest keeps the existing directory intact. Modified installs
+Existing ancestors must belong to root or the launching UID and must not allow
+group/other writes. The installed UUID directory and all four inventory files
+must belong to the launching UID and must not allow group/other writes; these
+checks also apply when revalidating backups. Unsafe owners or permissions are
+refused without automatically changing ownership or modes. An unchanged manifest
+keeps the existing directory intact. Modified installs
 must be reviewed/backed up by the user before reinstalling; the hook does not
 repair them or claim their contents.
 
